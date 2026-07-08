@@ -492,8 +492,8 @@ void VoiceClient::save_settings(const char* path) {
     // closing the settings window — rewrites the file without them, silently
     // resetting the overlay mode to default on the next launch. (This is why
     // setting overlay_external: 1 "didn't work" — it got wiped on first save.)
-    bool has_ext = false, has_pace = false;
-    std::string ext_val, pace_val;
+    bool has_enabled = false, has_backend = false, has_ext = false, has_pace = false, has_interval = false, has_fps_cap = false;
+    std::string enabled_val, backend_val, ext_val, pace_val, interval_val, fps_cap_val;
     {
         std::ifstream rf(path);
         std::string line;
@@ -509,8 +509,12 @@ void VoiceClient::save_settings(const char* path) {
             if (colon == std::string::npos) continue;
             std::string key = trim(line.substr(0, colon));
             std::string val = trim(line.substr(colon + 1));
-            if (key == "overlay_external")         { has_ext  = true; ext_val  = val; }
+            if (key == "overlay_enabled")          { has_enabled = true; enabled_val = val; }
+            else if (key == "overlay_backend")     { has_backend = true; backend_val = val; }
+            else if (key == "overlay_external")    { has_ext  = true; ext_val  = val; }
             else if (key == "overlay_pacing_fill") { has_pace = true; pace_val = val; }
+            else if (key == "overlay_frame_interval") { has_interval = true; interval_val = val; }
+            else if (key == "dx9_present_fps_cap") { has_fps_cap = true; fps_cap_val = val; }
         }
     }
 
@@ -556,11 +560,20 @@ void VoiceClient::save_settings(const char* path) {
     // Always emit the overlay-mode keys — with the current value, or the default
     // if the file didn't have them — so they're ALWAYS visible/editable in the
     // config (and survive this rewrite; they're read by dllmain at startup).
-    f << "// overlay_external: 0 = draw in-game (default; OBS Game Capture, safe for multi-box)\n"
+    f << "// overlay_enabled: 0 = no overlay and no D3D9 hook (diagnostic), 1 = normal\n"
+      << "overlay_enabled: " << (has_enabled ? enabled_val : "1") << "\n"
+      << "// overlay_backend: dx9 = native D3D9, dx11 = dgVoodoo2/DXGI minimal overlay\n"
+      << "overlay_backend: " << (has_backend ? backend_val : "dx9") << "\n"
+      << "\n"
+      << "// overlay_external: 0 = draw in-game (default; OBS Game Capture, safe for multi-box)\n"
       << "//                   1 = separate window (single-client only; OBS/2nd box won't work)\n"
       << "overlay_external: "    << (has_ext  ? ext_val  : "0") << "\n"
       << "// overlay_pacing_fill: 0 = off (default). Legacy frame-pacing workaround; not needed.\n"
-      << "overlay_pacing_fill: " << (has_pace ? pace_val : "0") << "\n";
+      << "overlay_pacing_fill: " << (has_pace ? pace_val : "0") << "\n"
+      << "// overlay_frame_interval: 1 = every frame (default), 2 = every other frame, 3+ = lighter\n"
+      << "overlay_frame_interval: " << (has_interval ? interval_val : "1") << "\n"
+      << "// dx9_present_fps_cap: 0 = off, 60/75/120 = lock DX9 Present pacing in windowed/DWM\n"
+      << "dx9_present_fps_cap: " << (has_fps_cap ? fps_cap_val : "0") << "\n";
     // NOTE: client_secret is intentionally NOT persisted — it is a shared
     // hard-coded secret baked into the DLL. Writing it to the user's
     // settings file means a stale/empty entry from an older build would

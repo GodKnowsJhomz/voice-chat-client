@@ -107,7 +107,51 @@ static void temp_hook_remove() {
 // ── Final hooks (vtable-based, no trampoline) ─────────────────────
 
 static bool g_rendered_this_frame = false;
+static uint32_t g_frame_counter = 0;
+static std::atomic<int> g_frame_interval{ 1 };
+static std::atomic<int> g_present_fps_cap{ 0 };
 static std::atomic<bool> g_game_windowed{ true };
+
+static bool should_render_overlay_this_frame() {
+    int interval = g_frame_interval.load(std::memory_order_relaxed);
+    if (interval < 1) interval = 1;
+    return (g_frame_counter % static_cast<uint32_t>(interval)) == 0;
+}
+
+static void pace_present() {
+    int fps = g_present_fps_cap.load(std::memory_order_relaxed);
+    if (fps <= 0)
+        return;
+
+    static LARGE_INTEGER freq{};
+    static LARGE_INTEGER next{};
+    if (freq.QuadPart == 0)
+        QueryPerformanceFrequency(&freq);
+
+    const LONGLONG interval = freq.QuadPart / fps;
+    if (interval <= 0)
+        return;
+
+    LARGE_INTEGER now{};
+    QueryPerformanceCounter(&now);
+    if (next.QuadPart == 0 || now.QuadPart > next.QuadPart + interval * 2)
+        next.QuadPart = now.QuadPart + interval;
+
+    for (;;) {
+        QueryPerformanceCounter(&now);
+        const LONGLONG remaining = next.QuadPart - now.QuadPart;
+        if (remaining <= 0)
+            break;
+
+        const DWORD ms = static_cast<DWORD>((remaining * 1000) / freq.QuadPart);
+        if (ms > 1)
+            Sleep(ms - 1);
+        else
+            Sleep(0);
+    }
+
+    next.QuadPart += interval;
+}
 
 // Query the device's swapchain to learn windowed vs exclusive-fullscreen state.
 static void capture_windowed_state(LPDIRECT3DDEVICE9 pDevice) {
@@ -176,7 +220,8 @@ HRESULT APIENTRY hkEndScene(LPDIRECT3DDEVICE9 pDevice) {
     // game's frame pacing (visible as walk/map-scroll stutter).
     if (g_installed && !g_rendered_this_frame) {
         g_rendered_this_frame = true;
-        do_frame(pDevice);
+        if (should_render_overlay_this_frame())
+            do_frame(pDevice);
     }
     return oEndScene(pDevice); // direct call — no trampoline
 }
@@ -188,10 +233,13 @@ HRESULT APIENTRY hkPresent(LPDIRECT3DDEVICE9 pDevice,
     // frame boundary, so reset the once-per-frame guard here.
     if (g_installed && !g_rendered_this_frame) {
         g_rendered_this_frame = true;
-        do_frame(pDevice);
+        if (should_render_overlay_this_frame())
+            do_frame(pDevice);
     }
+    pace_present();
     HRESULT hr = oPresent(pDevice, pSrcRect, pDstRect, hWnd, pDirtyRegion); // direct
     g_rendered_this_frame = false;
+    ++g_frame_counter;
     return hr;
 }
 
@@ -210,6 +258,16 @@ HRESULT APIENTRY hkReset(LPDIRECT3DDEVICE9 pDevice, D3DPRESENT_PARAMETERS* pPP) 
 }
 
 bool D3D9Hook::is_game_windowed() { return g_game_windowed.load(); }
+void D3D9Hook::set_frame_interval(int interval) {
+    if (interval < 1) interval = 1;
+    if (interval > 10) interval = 10;
+    g_frame_interval.store(interval, std::memory_order_relaxed);
+}
+void D3D9Hook::set_present_fps_cap(int fps) {
+    if (fps < 0) fps = 0;
+    if (fps > 240) fps = 240;
+    g_present_fps_cap.store(fps, std::memory_order_relaxed);
+}
 
 // ── One-shot temp hook: fires once, then switches to vtable ──────
 

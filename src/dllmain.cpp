@@ -2,6 +2,7 @@
 #include "external_overlay.hpp"
 #include "voice_client.hpp"
 #include "d3d9_hook.hpp"
+#include "dxgi_hook.hpp"
 #include "dbglog.hpp"
 #include "anti_tamper.hpp"
 #include <Windows.h>
@@ -39,6 +40,52 @@ static bool read_overlay_external() {
     return false;                              // key absent → default in-process
 }
 
+static bool read_overlay_enabled() {
+    std::ifstream f("voice_client.conf");
+    if (!f.is_open()) return true;             // default: overlay enabled
+    std::string line;
+    while (std::getline(f, line)) {
+        auto cm = line.find("//");
+        if (cm != std::string::npos) line = line.substr(0, cm);
+        auto colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string key = line.substr(0, colon);
+        std::string val = line.substr(colon + 1);
+        auto trim = [](std::string& s) {
+            size_t a = s.find_first_not_of(" \t\r\n");
+            size_t b = s.find_last_not_of(" \t\r\n");
+            s = (a == std::string::npos) ? "" : s.substr(a, b - a + 1);
+        };
+        trim(key); trim(val);
+        if (key == "overlay_enabled")
+            return !(val == "0" || val == "false");
+    }
+    return true;
+}
+
+static std::string read_overlay_backend() {
+    std::ifstream f("voice_client.conf");
+    if (!f.is_open()) return "dx9";
+    std::string line;
+    while (std::getline(f, line)) {
+        auto cm = line.find("//");
+        if (cm != std::string::npos) line = line.substr(0, cm);
+        auto colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string key = line.substr(0, colon);
+        std::string val = line.substr(colon + 1);
+        auto trim = [](std::string& s) {
+            size_t a = s.find_first_not_of(" \t\r\n");
+            size_t b = s.find_last_not_of(" \t\r\n");
+            s = (a == std::string::npos) ? "" : s.substr(a, b - a + 1);
+        };
+        trim(key); trim(val);
+        if (key == "overlay_backend")
+            return val;
+    }
+    return "dx9";
+}
+
 // Full-screen fill passes that used to steady RO's frame pacing. The real cause
 // of the map-scroll stutter (audio threads on MMCSS "Pro Audio" preempting the
 // game) is fixed now, so this workaround defaults to 0 (off). Left configurable
@@ -62,6 +109,68 @@ static int read_pacing_fill() {
         trim(key); trim(val);
         if (key == "overlay_pacing_fill") {
             try { int n = std::stoi(val); return n < 0 ? 0 : n; } catch (...) { return 0; }
+        }
+    }
+    return 0;
+}
+
+static int read_overlay_frame_interval() {
+    std::ifstream f("voice_client.conf");
+    if (!f.is_open()) return 1;
+    std::string line;
+    while (std::getline(f, line)) {
+        auto cm = line.find("//");
+        if (cm != std::string::npos) line = line.substr(0, cm);
+        auto colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string key = line.substr(0, colon);
+        std::string val = line.substr(colon + 1);
+        auto trim = [](std::string& s) {
+            size_t a = s.find_first_not_of(" \t\r\n");
+            size_t b = s.find_last_not_of(" \t\r\n");
+            s = (a == std::string::npos) ? "" : s.substr(a, b - a + 1);
+        };
+        trim(key); trim(val);
+        if (key == "overlay_frame_interval") {
+            try {
+                int n = std::stoi(val);
+                if (n < 1) n = 1;
+                if (n > 10) n = 10;
+                return n;
+            } catch (...) {
+                return 1;
+            }
+        }
+    }
+    return 1;
+}
+
+static int read_dx9_present_fps_cap() {
+    std::ifstream f("voice_client.conf");
+    if (!f.is_open()) return 0;
+    std::string line;
+    while (std::getline(f, line)) {
+        auto cm = line.find("//");
+        if (cm != std::string::npos) line = line.substr(0, cm);
+        auto colon = line.find(':');
+        if (colon == std::string::npos) continue;
+        std::string key = line.substr(0, colon);
+        std::string val = line.substr(colon + 1);
+        auto trim = [](std::string& s) {
+            size_t a = s.find_first_not_of(" \t\r\n");
+            size_t b = s.find_last_not_of(" \t\r\n");
+            s = (a == std::string::npos) ? "" : s.substr(a, b - a + 1);
+        };
+        trim(key); trim(val);
+        if (key == "dx9_present_fps_cap") {
+            try {
+                int n = std::stoi(val);
+                if (n < 0) n = 0;
+                if (n > 240) n = 240;
+                return n;
+            } catch (...) {
+                return 0;
+            }
         }
     }
     return 0;
@@ -143,25 +252,50 @@ static DWORD WINAPI MainThread(LPVOID) {
     if (g_at_thread)
         SetThreadPriority(g_at_thread, THREAD_PRIORITY_BELOW_NORMAL);
 
-    // Overlay mode: default is the in-process overlay (visible to streamers).
-    // Only start the external Discord-style overlay if explicitly requested in
-    // voice_client.conf (overlay_external: 1). Must start before the D3D9 hook so
-    // it can claim UI ownership before the first rendered frame.
-    if (read_overlay_external()) {
-        ExternalOverlay::start();
-        dbglog("ExternalOverlay::start called (overlay_external=1)");
+    if (read_overlay_enabled()) {
+        const std::string backend = read_overlay_backend();
+        char backend_log[96];
+        sprintf_s(backend_log, "overlay_backend=%s", backend.c_str());
+        dbglog(backend_log);
+        if (backend == "dx11") {
+            dbglog("Calling DxgiHook::install (overlay_backend=dx11)");
+            bool hook_ok = DxgiHook::install();
+            dbglog(hook_ok ? "DxgiHook::install OK" : "DxgiHook::install FAILED");
+        } else if (backend == "auto") {
+            dbglog("Calling DxgiHook::install (overlay_backend=auto)");
+            bool dxgi_ok = DxgiHook::install();
+            dbglog(dxgi_ok ? "DxgiHook::install OK" : "DxgiHook::install FAILED");
+            D3D9Hook::set_frame_interval(read_overlay_frame_interval());
+            D3D9Hook::set_present_fps_cap(read_dx9_present_fps_cap());
+            dbglog("Calling D3D9Hook::install (overlay_backend=auto fallback)");
+            bool d3d9_ok = D3D9Hook::install();
+            dbglog(d3d9_ok ? "D3D9Hook::install OK" : "D3D9Hook::install FAILED");
+        } else {
+        // Overlay mode: default is the in-process overlay (visible to streamers).
+        // Only start the external Discord-style overlay if explicitly requested in
+        // voice_client.conf (overlay_external: 1). Must start before the D3D9 hook so
+        // it can claim UI ownership before the first rendered frame.
+        if (read_overlay_external()) {
+            ExternalOverlay::start();
+            dbglog("ExternalOverlay::start called (overlay_external=1)");
+        } else {
+            dbglog("Using in-process overlay (default)");
+        }
+
+        // Frame-pacing stabilizer for the in-process overlay (fixes RO map-scroll
+        // stutter). Harmless for the external overlay (it gates on the in-process
+        // device anyway). Configurable via overlay_pacing_fill (default 1).
+        Overlay::set_pacing_fill(read_pacing_fill());
+        D3D9Hook::set_frame_interval(read_overlay_frame_interval());
+        D3D9Hook::set_present_fps_cap(read_dx9_present_fps_cap());
+
+        dbglog("Calling D3D9Hook::install");
+        bool hook_ok = D3D9Hook::install();
+        dbglog(hook_ok ? "D3D9Hook::install OK" : "D3D9Hook::install FAILED");
+        }
     } else {
-        dbglog("Using in-process overlay (default)");
+        dbglog("Overlay disabled by config (overlay_enabled=0); skipping D3D9 hook");
     }
-
-    // Frame-pacing stabilizer for the in-process overlay (fixes RO map-scroll
-    // stutter). Harmless for the external overlay (it gates on the in-process
-    // device anyway). Configurable via overlay_pacing_fill (default 1).
-    Overlay::set_pacing_fill(read_pacing_fill());
-
-    dbglog("Calling D3D9Hook::install");
-    bool hook_ok = D3D9Hook::install();
-    dbglog(hook_ok ? "D3D9Hook::install OK" : "D3D9Hook::install FAILED");
     if (g_shutdown_started.load())
         return 0;
 

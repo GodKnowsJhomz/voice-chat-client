@@ -6,6 +6,8 @@ public:
     static bool install();
     static void uninstall();
     static bool is_installed();
+    static void set_frame_interval(int interval);
+    static void set_present_fps_cap(int fps);
 
     // True when the game's swapchain is windowed (incl. borderless). False means
     // exclusive fullscreen, where a layered overlay window cannot be shown — the
