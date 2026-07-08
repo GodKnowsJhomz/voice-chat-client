@@ -2294,48 +2294,48 @@ void render(LPDIRECT3DDEVICE9 pDevice) {
             bg->AddRectFilled(ImVec2(0, 0), tio.DisplaySize, IM_COL32(0, 0, 0, 1));
     }
 
-    // Capture whether ImGui wants the mouse/keyboard this frame so the external
-    // overlay can toggle click-through and decide whether to swallow keystrokes.
-    g_ext_want_capture = ImGui::GetIO().WantCaptureMouse;
-    g_ext_want_text    = ImGui::GetIO().WantTextInput;
-
-    // Decide if the overlay has animating / interactive content this frame so the
-    // external overlay can render at full rate now and idle slowly otherwise.
-    g_ext_hi_fps = g_ext_want_capture || g_settings_open || g_call_popup ||
-                   g_whisper_popup || vc.is_ptt_active() || vc.is_locally_talking() ||
-                   vc.any_speaker_recent();   // lock-free; no per-frame alloc on the render thread
-
     ImGui::EndFrame();
     ImGui::Render();
     ImDrawData* dd = ImGui::GetDrawData();
     ImGui_ImplDX9_RenderDrawData(dd);
 
-    // Compute the bounding box of everything actually drawn this frame, so the
-    // external overlay only reads back + blits that region (not the whole screen).
-    // We use per-vertex positions for a tight box (clip rects can be display-wide).
-    float x0 = FLT_MAX, y0 = FLT_MAX, x1 = -FLT_MAX, y1 = -FLT_MAX;
-    for (int i = 0; i < dd->CmdListsCount; ++i) {
-        const ImDrawList* cl = dd->CmdLists[i];
-        const ImDrawVert* vb = cl->VtxBuffer.Data;
-        for (int v = 0; v < cl->VtxBuffer.Size; ++v) {
-            const ImVec2& p = vb[v].pos;
-            if (p.x < x0) x0 = p.x; if (p.y < y0) y0 = p.y;
-            if (p.x > x1) x1 = p.x; if (p.y > y1) y1 = p.y;
+    // These flags and the drawn-region bbox are consumed only by the external
+    // layered overlay. In the default in-process mode, scanning every ImGui
+    // vertex here is pure render-thread overhead.
+    if (g_external_mode) {
+        g_ext_want_capture = ImGui::GetIO().WantCaptureMouse;
+        g_ext_want_text    = ImGui::GetIO().WantTextInput;
+
+        g_ext_hi_fps = g_ext_want_capture || g_settings_open || g_call_popup ||
+                       g_whisper_popup || vc.is_ptt_active() || vc.is_locally_talking() ||
+                       vc.any_speaker_recent();   // lock-free; no per-frame alloc
+
+        float x0 = FLT_MAX, y0 = FLT_MAX, x1 = -FLT_MAX, y1 = -FLT_MAX;
+        for (int i = 0; i < dd->CmdListsCount; ++i) {
+            const ImDrawList* cl = dd->CmdLists[i];
+            const ImDrawVert* vb = cl->VtxBuffer.Data;
+            for (int v = 0; v < cl->VtxBuffer.Size; ++v) {
+                const ImVec2& p = vb[v].pos;
+                if (p.x < x0) x0 = p.x; if (p.y < y0) y0 = p.y;
+                if (p.x > x1) x1 = p.x; if (p.y > y1) y1 = p.y;
+            }
         }
-    }
-    if (x1 >= x0 && y1 >= y0) {
-        g_draw_x0 = x0; g_draw_y0 = y0; g_draw_x1 = x1; g_draw_y1 = y1;
-        g_has_draw = true;
-    } else {
-        g_has_draw = false;
+        if (x1 >= x0 && y1 >= y0) {
+            g_draw_x0 = x0; g_draw_y0 = y0; g_draw_x1 = x1; g_draw_y1 = y1;
+            g_has_draw = true;
+        } else {
+            g_has_draw = false;
+        }
     }
 
     // ── Render-time stats (diagnostics) ─────────────────────────────────────
-    LARGE_INTEGER t_end, freq;
+    static LARGE_INTEGER s_freq = [] {
+        LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f;
+    }();
+    LARGE_INTEGER t_end;
     QueryPerformanceCounter(&t_end);
-    QueryPerformanceFrequency(&freq);
     const float ms = static_cast<float>(
-        (double)(t_end.QuadPart - t_start.QuadPart) * 1000.0 / (double)freq.QuadPart);
+        (double)(t_end.QuadPart - t_start.QuadPart) * 1000.0 / (double)s_freq.QuadPart);
     float avg = g_render_avg_ms.load(std::memory_order_relaxed);
     avg = (avg <= 0.f) ? ms : (avg * 0.95f + ms * 0.05f);
     g_render_avg_ms.store(avg, std::memory_order_relaxed);

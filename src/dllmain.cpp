@@ -109,6 +109,8 @@ static HANDLE g_at_thread = nullptr;
 static HANDLE g_main_thread = nullptr;
 
 static DWORD WINAPI AntiTamperThread(LPVOID) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+
     // Initial check right at startup (catches tools that were already open
     // before the DLL was injected).
     anti_tamper::periodic_check();
@@ -138,6 +140,8 @@ static DWORD WINAPI MainThread(LPVOID) {
     // Start anti-tamper monitor before any real work begins.
     g_at_running.store(true);
     g_at_thread = CreateThread(nullptr, 0, AntiTamperThread, nullptr, 0, nullptr);
+    if (g_at_thread)
+        SetThreadPriority(g_at_thread, THREAD_PRIORITY_BELOW_NORMAL);
 
     // Overlay mode: default is the in-process overlay (visible to streamers).
     // Only start the external Discord-style overlay if explicitly requested in

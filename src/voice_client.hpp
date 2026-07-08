@@ -37,13 +37,12 @@ public:
 
     bool        is_connected()    const { return ws_.is_connected(); }
     bool        is_auth_confirmed() const { return auth_confirmed_.load(); } // server sent auth_ok
-    bool        is_in_game()    const { return auth_confirmed_ && in_map_; }  // true = authed & on a map
-    // on_map = best-known "player is on a map". in_map_ comes from client memory
-    // (AID/CID), but some clients keep those set at char-select, so we also honor
-    // the authoritative "map session ended" signal from the map server: once it
-    // says the session ended we treat the player as off-map (hide the voice bar,
-    // not just grey it) until the next successful auth_ok.
-    bool        is_on_map()     const { return in_map_.load() && !server_off_map_.load(); }
+    bool        is_in_game()    const { return is_on_map(); }  // true = server-confirmed map session
+    // on_map = authoritative "player has an active map session". Memory AID/CID
+    // alone is not enough because some clients keep them populated on the
+    // character-select screen. Only show the bar after the voice/map server has
+    // confirmed auth, and hide it on server-side map-session end.
+    bool        is_on_map()     const { return auth_confirmed_.load() && in_map_.load() && !server_off_map_.load(); }
     bool        is_muted()      const { return muted_.load(); }
     bool        is_ptt_active() const { return ptt_active_.load(); }
     Channel     get_channel()   const;

@@ -813,10 +813,18 @@ void VoiceClient::shutdown() {
 }
 
 void VoiceClient::on_ws_closed() {
+    const bool was_auth_confirmed = auth_confirmed_.load();
     const bool auth_was_rejected = auth_sent_ && !auth_confirmed_;
     auth_sent_      = false;
     auth_confirmed_ = false;
     g_udp_voice.stop();
+
+    // Some RO clients keep AID/CID populated on the character-select screen.
+    // If the map session was already authenticated and the server closes it
+    // (auth_revoke / char-select), hide the bar until the next auth_ok instead
+    // of leaving an "offline" badge on character select.
+    if (was_auth_confirmed)
+        server_off_map_.store(true);
 
     const bool charswitch_kick = expecting_charswitch_kick_.exchange(false);
     if (!charswitch_kick && auth_was_rejected) {
@@ -1194,17 +1202,19 @@ void VoiceClient::on_text_message(const std::string& msg) {
             server_off_map_ = true;
         else if (err == "session replaced by new login")
             session_replaced_ = true;
-        else if (err == "credentials mismatch" || err == "no active map session") {
-            // Not validly in game right now: either the voice server's advisory
-            // says a different account_id/login_id1 owns this char_id ("credentials
-            // mismatch" — another login took the account, or a spoof), or the
-            // map server has no advisory for us yet ("no active map session").
-            // Back off before reconnecting so we don't tight-loop / ping-pong,
-            // then RETRY — we never permanently give up, so a real session always
-            // recovers once its login_id1 matches the advisory. These are the exact
-            // strings the voice server sends (server.cpp) — keep them in sync.
+        else if (err == "no active map session") {
+            // The map server has not advertised this character as in-map yet.
+            // Keep the bar hidden, but retry quickly: the voice server remains
+            // the authority and will only send auth_ok once the advisory exists.
+            server_off_map_ = true;
             reconnect_backoff_until_ = GetTickCount() + 8000;
-            dbglog("[ws] account/advisory conflict — backing off 8s before reconnect");
+            dbglog("[ws] no active map session - backing off 8s before reconnect");
+        }
+        else if (err == "credentials mismatch") {
+            // Advisory exists but does not match this client. Back off longer to
+            // avoid ping-pong with another login or a stale/spoofed session.
+            reconnect_backoff_until_ = GetTickCount() + 8000;
+            dbglog("[ws] credentials mismatch - backing off 8s before reconnect");
         }
         else if (err == "session contested") {
             // The voice server's flap dampener is keeping another live client
@@ -1568,7 +1578,7 @@ void VoiceClient::position_loop() {
                 std::lock_guard<std::mutex> lk(ws_send_queue_mtx_);
                 pending.swap(ws_send_queue_);
             }
-            if (ws_.is_connected()) {
+            if (ws_.is_connected() && auth_confirmed_.load()) {
                 for (auto& m : pending)
                     ws_.send_text(m);
             }
@@ -1628,8 +1638,10 @@ void VoiceClient::position_loop() {
             // Keep in_map_ current even while disconnected.
             // This makes is_in_game() return false during char select (map="")
             // immediately — no need to wait for the server to close the connection.
-            if (!ws_.is_connected())
+            if (!ws_.is_connected()) {
+                reconnect_backoff_until_.store(0);
                 continue;
+            }
 
             // Whisper timeout — auto-reject/cancel after 30s
             WhisperState whisper_state = WhisperState::None;
@@ -1690,7 +1702,7 @@ void VoiceClient::position_loop() {
                 continue;
 
             DWORD now = GetTickCount();
-            if (ws_.is_connected() && now - last_ping_tick >= 5000) {
+            if (ws_.is_connected() && auth_confirmed_.load() && now - last_ping_tick >= 5000) {
                 json ping;
                 ping["type"] = "ping";
                 ping["t"] = static_cast<uint32_t>(now);
@@ -1793,7 +1805,7 @@ void VoiceClient::on_audio_captured(const std::vector<int16_t>& pcm) {
         tx_seq_.store(0, std::memory_order_relaxed);
     }
 
-    if (!ws_.is_connected() || !in_map_.load() || muted_.load() || voice_banned_.load() || no_license_.load() || deafened_.load() || !ptt_active_.load() || !auth_sent_ || !opus_enc_) {
+    if (!ws_.is_connected() || !in_map_.load() || muted_.load() || voice_banned_.load() || no_license_.load() || deafened_.load() || !ptt_active_.load() || !auth_confirmed_.load() || !opus_enc_) {
         s_tx_speech_hangover = 0;
         // Always clear accumulator when not transmitting so stale audio
         // cannot leak into the next PTT press or reconnect.
@@ -1914,7 +1926,7 @@ void VoiceClient::set_ptt(bool active) {
         reset_mic_pipeline_.store(true);
     }
 
-    if (!ws_.is_connected()) return;
+    if (!ws_.is_connected() || !auth_confirmed_.load()) return;
 
     json msg;
     msg["type"]  = "ptt";
@@ -1939,7 +1951,7 @@ void VoiceClient::set_mute(bool muted) {
         reset_mic_pipeline_.store(true);
     }
 
-    if (!ws_.is_connected()) return;
+    if (!ws_.is_connected() || !auth_confirmed_.load()) return;
 
     json msg;
     msg["type"]  = "mute";
@@ -1965,7 +1977,7 @@ void VoiceClient::set_deafen(bool v) {
         set_mute(false);
     }
 
-    if (!ws_.is_connected()) return;
+    if (!ws_.is_connected() || !auth_confirmed_.load()) return;
 
     json msg;
     msg["type"]  = "deafen";
@@ -2011,7 +2023,7 @@ void VoiceClient::set_channel(Channel ch) {
     // of the send queue (priority) so it is not delayed behind pending audio
     // frames — without this, set_channel could wait 60-100ms behind backlogged
     // 20ms audio packets before reaching the server.
-    if (ws_.is_connected() && auth_sent_) {
+    if (ws_.is_connected() && auth_confirmed_.load()) {
         json msg;
         msg["type"]    = "set_channel";
         msg["channel"] = static_cast<int>(ch);
